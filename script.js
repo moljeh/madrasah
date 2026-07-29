@@ -384,6 +384,14 @@ function logout() {
     }).then((result) => { 
         if (result.isConfirmed) { 
             // --- KODE KEAMANAN 4: HAPUS TOKEN ---
+            const tokenLogout = sessionStorage.getItem('tokenMadasa');
+            if (tokenLogout) {
+                const fdLogout = new URLSearchParams();
+                fdLogout.append('action', 'logout');
+                fdLogout.append('token', tokenLogout);
+                // Tidak perlu menunggu respons agar proses keluar terasa cepat.
+                fetch(GAS_URL, { method: 'POST', body: fdLogout }).catch(() => {});
+            }
             sessionStorage.removeItem('tokenMadasa');
             // ------------------------------------
 			

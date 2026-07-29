@@ -7,6 +7,7 @@ function doPost(e) {
 
     // 1. IZINKAN AKSES LOGIN & PORTAL ORTU TANPA TOKEN
 if (action === 'login') return prosesLogin(e);
+if (action === 'logout') return prosesLogout(e);
 if (action === 'simpanAbsenBarcode') return simpanAbsenBarcode(e);
 
 // --- JALUR KHUSUS PORTAL WALI SANTRI ---
@@ -53,6 +54,9 @@ if (action === 'simpanAbsenBarcode') return simpanAbsenBarcode(e);
         if (!isNaN(waktuLogin.getTime()) && umurSesi <= batasSesi) {
           tokenValid = true;
           userRole = dataSesi[i][2];
+        } else {
+          // Token ini sudah kedaluwarsa. Hapus hanya baris token tersebut.
+          try { sheetSesi.deleteRow(i + 1); } catch (hapusErr) {}
         }
         break;
       }
@@ -158,17 +162,59 @@ function getSantriPublik(e) {
 function getNilaiSantriPublik(e) {
   var s = cariSantriPublik_(e.parameter.nis, e.parameter.tanggal_lahir);
   if (!s) return responError('Akses ditolak.');
+
   var ss = SpreadsheetApp.getActiveSpreadsheet();
+
+  // Nilai portal wali hanya boleh keluar dari server jika kelas sudah dirilis.
+  var sheetSet = ss.getSheetByName('SETTING_RAPOR');
+  var statusRilis = 'Sembunyi';
+
+  if (sheetSet) {
+    var dataSet = sheetSet.getDataRange().getValues();
+    for (var x = 1; x < dataSet.length; x++) {
+      if ((dataSet[x][0] || '').toString().trim() === s.kelas.toString().trim()) {
+        statusRilis = (dataSet[x][9] || 'Sembunyi').toString().trim();
+        break;
+      }
+    }
+  }
+
+  // PENTING: jika belum dirilis, angka nilai dan header tidak dikirim ke browser.
+  if (statusRilis.toLowerCase() !== 'rilis') {
+    return responSukses({
+      data: [],
+      headers: [],
+      status_rilis: 'Sembunyi'
+    });
+  }
+
   var sheet = ss.getSheetByName('NILAI ' + s.kelas);
-  if (!sheet) return responSukses({ data: [], headers: [] });
+  if (!sheet) {
+    return responSukses({ data: [], headers: [], status_rilis: 'Rilis' });
+  }
+
   var data = sheet.getDataRange().getValues();
   var headers = data[0] || [];
-  var idxNis = headers.findIndex(function(h){ return h && h.toString().toUpperCase().indexOf('NIS') !== -1; });
+  var idxNis = headers.findIndex(function(h) {
+    return h && h.toString().toUpperCase().indexOf('NIS') !== -1;
+  });
+
   var rows = [];
-  for (var i=1; i<data.length; i++) {
-    if (idxNis > -1 && data[i][idxNis] && data[i][idxNis].toString().replace(/'/g,'').trim() === s.nis) rows.push(data[i]);
+  for (var i = 1; i < data.length; i++) {
+    if (
+      idxNis > -1 &&
+      data[i][idxNis] &&
+      data[i][idxNis].toString().replace(/'/g, '').trim() === s.nis
+    ) {
+      rows.push(data[i]);
+    }
   }
-  return responSukses({ data: rows, headers: headers });
+
+  return responSukses({
+    data: rows,
+    headers: headers,
+    status_rilis: 'Rilis'
+  });
 }
 
 function getPengaturanSantriPublik(e) {
@@ -200,45 +246,115 @@ function getSppSantriPublik(e) {
 // 1. FUNGSI LOGIN (PEMBUAT TOKEN)
 // =================================================================
 function prosesLogin(e) {
-  var ss = SpreadsheetApp.getActiveSpreadsheet();
-  var sheet = ss.getSheetByName('LOGIN');
-  
-  if (!sheet) return responError('Sistem Error: Sheet "LOGIN" tidak ditemukan di database.');
+  var lock = LockService.getScriptLock();
+  if (!lock.tryLock(10000)) {
+    return responError('Sistem login sedang sibuk. Silakan coba lagi.');
+  }
 
-  // Bersihkan spasi kosong jika ada
-  var user = e.parameter.username ? e.parameter.username.toString().trim() : "";
-  var pass = e.parameter.password ? e.parameter.password.toString().trim() : "";
-  var data = sheet.getDataRange().getValues();
+  try {
+    var ss = SpreadsheetApp.getActiveSpreadsheet();
+    var sheet = ss.getSheetByName('LOGIN');
 
-  for (var i = 1; i < data.length; i++) {
-    // Cocokkan data (pastikan huruf besar/kecil dan spasi akurat)
-    if (data[i][0].toString().trim() === user && data[i][1].toString().trim() === pass) {
-      var roleUser = data[i][2];
-      var namaUser = data[i][3];
+    if (!sheet) return responError('Sistem Error: Sheet "LOGIN" tidak ditemukan di database.');
 
-      // --- KODE BARU: PEMBUATAN TOKEN ---
-      var token = Utilities.getUuid();
-      var sheetSesi = ss.getSheetByName('SesiAktif');
-      
-      // Buat sheet jika belum ada
-      if (!sheetSesi) {
-        sheetSesi = ss.insertSheet('SesiAktif');
-        sheetSesi.appendRow(['Token', 'Username', 'Role', 'Waktu Login']);
-        sheetSesi.getRange("A1:D1").setFontWeight("bold").setBackground("#f87171");
+    var user = e.parameter.username ? e.parameter.username.toString().trim() : "";
+    var pass = e.parameter.password ? e.parameter.password.toString().trim() : "";
+    var data = sheet.getDataRange().getValues();
+
+    for (var i = 1; i < data.length; i++) {
+      var usernameTersimpan = (data[i][0] || '').toString().trim();
+      var passwordTersimpan = (data[i][1] || '').toString().trim();
+
+      // Mendukung password lama dan format SHA-256 jika nanti dimigrasikan.
+      if (
+        usernameTersimpan === user &&
+        passwordCocokMadasa_(pass, passwordTersimpan)
+      ) {
+        var roleUser = data[i][2];
+        var namaUser = data[i][3];
+
+        var sheetSesi = ss.getSheetByName('SesiAktif');
+        if (!sheetSesi) {
+          sheetSesi = ss.insertSheet('SesiAktif');
+          sheetSesi.appendRow(['Token', 'Username', 'Role', 'Waktu Login']);
+          sheetSesi.getRange("A1:D1").setFontWeight("bold").setBackground("#f87171");
+        }
+
+        // Bersihkan HANYA sesi yang sudah lewat 12 jam.
+        // Sesi pengguna lain maupun username yang sama di perangkat lain TIDAK dihapus.
+        bersihkanSesiKadaluarsa_(sheetSesi);
+
+        // Setiap proses login selalu mendapat token unik.
+        // Dengan demikian akun bersama seperti "gurumadasa" dapat dipakai
+        // banyak guru/perangkat secara bersamaan.
+        var token = Utilities.getUuid();
+        sheetSesi.appendRow([token, user, roleUser, new Date()]);
+
+        return responSukses({
+          role: roleUser,
+          name: namaUser,
+          token: token
+        });
       }
+    }
 
-      // Simpan token ke database SesiAktif
-      sheetSesi.appendRow([token, user, roleUser, new Date()]);
+    return responError('Username atau Password salah! Periksa kembali data Anda.');
+  } finally {
+    lock.releaseLock();
+  }
+}
 
-      // Kirim balik data ke browser beserta Token-nya
-      return responSukses({ 
-        role: roleUser, 
-        name: namaUser,
-        token: token 
-      });
+// Menghapus hanya token yang sudah kedaluwarsa (> 12 jam).
+// Tidak menghapus sesi pengguna lain dan tidak membatasi jumlah perangkat.
+function bersihkanSesiKadaluarsa_(sheetSesi) {
+  if (!sheetSesi || sheetSesi.getLastRow() < 2) return;
+
+  var data = sheetSesi.getRange(2, 1, sheetSesi.getLastRow() - 1, 4).getValues();
+  var sekarang = new Date().getTime();
+  var batasSesi = 12 * 60 * 60 * 1000;
+
+  // Hapus dari bawah agar nomor baris tidak bergeser.
+  for (var i = data.length - 1; i >= 0; i--) {
+    var waktuLogin = new Date(data[i][3]);
+    var invalid = isNaN(waktuLogin.getTime());
+    var kadaluarsa = !invalid && (sekarang - waktuLogin.getTime() > batasSesi);
+
+    if (invalid || kadaluarsa) {
+      sheetSesi.deleteRow(i + 2);
     }
   }
-  return responError('Username atau Password salah! Periksa kembali data Anda.');
+}
+
+// Logout hanya menghapus token perangkat/browser yang melakukan logout.
+// Guru lain yang memakai username yang sama tetap login.
+function prosesLogout(e) {
+  var token = (e.parameter.token || '').toString().trim();
+  if (!token) return responSukses({ message: 'Sesi sudah berakhir.' });
+
+  var lock = LockService.getScriptLock();
+  if (!lock.tryLock(10000)) {
+    return responError('Sistem sedang sibuk. Silakan coba logout kembali.');
+  }
+
+  try {
+    var ss = SpreadsheetApp.getActiveSpreadsheet();
+    var sheetSesi = ss.getSheetByName('SesiAktif');
+    if (!sheetSesi || sheetSesi.getLastRow() < 2) {
+      return responSukses({ message: 'Logout berhasil.' });
+    }
+
+    var data = sheetSesi.getRange(2, 1, sheetSesi.getLastRow() - 1, 4).getValues();
+    for (var i = data.length - 1; i >= 0; i--) {
+      if ((data[i][0] || '').toString() === token) {
+        sheetSesi.deleteRow(i + 2);
+        break;
+      }
+    }
+
+    return responSukses({ message: 'Logout berhasil.' });
+  } finally {
+    lock.releaseLock();
+  }
 }
 
 // =================================================================
@@ -808,7 +924,7 @@ function simpanPengaturan(e) {
     }
     
     if (rowIndexSet === -1) {
-      sheetSet.appendRow([kelas, setUmum.semester, setUmum.tahun, setUmum.tanggal, setUmum.wali, setUmum.kepala, '', '', '']);
+      sheetSet.appendRow([kelas, setUmum.semester, setUmum.tahun, setUmum.tanggal, setUmum.wali, setUmum.kepala, '', '', '', setUmum.status_rilis || 'Sembunyi']);
     } else {
       sheetSet.getRange(rowIndexSet, 2).setValue(setUmum.semester);
       sheetSet.getRange(rowIndexSet, 3).setValue(setUmum.tahun);
@@ -1432,6 +1548,49 @@ function getSppSantri(e) {
 // 1. FUNGSI SIMPAN ABSENSI BARCODE & MANUAL (ANTI GANDA & ANTI LIBUR)
 // =================================================================
 function simpanAbsenBarcode(e) {
+  // KEAMANAN ABSENSI PUBLIK:
+  // Endpoint memang tidak memakai token guru/admin, tetapi request divalidasi
+  // dan dibatasi agar tidak mudah dipakai untuk spam/pengiriman absensi palsu.
+  if (!e || !e.parameter) return responError('Permintaan absensi tidak valid.');
+
+  var nisAbsen = (e.parameter.nis || e.parameter.NIS || '').toString().replace(/'/g, '').trim();
+  if (!nisAbsen || !/^[A-Za-z0-9._-]{2,40}$/.test(nisAbsen)) {
+    return responError('NIS tidak valid.');
+  }
+
+  // Rate limit per NIS: maksimal satu request setiap 10 detik.
+  var cacheAbsen = CacheService.getScriptCache();
+  var keyAbsen = 'ABSEN_' + nisAbsen;
+  if (cacheAbsen.get(keyAbsen)) {
+    return responError('Absensi baru saja dikirim. Tunggu beberapa detik lalu coba lagi.');
+  }
+  cacheAbsen.put(keyAbsen, '1', 10);
+
+  // Pastikan NIS benar-benar terdaftar sebelum menyimpan absensi.
+  var ssAbsen = SpreadsheetApp.getActiveSpreadsheet();
+  var shSantriAbsen = ssAbsen.getSheetByName('SANTRI');
+  if (!shSantriAbsen) return responError('Data santri tidak tersedia.');
+
+  var dataSantriAbsen = shSantriAbsen.getDataRange().getValues();
+  var headerSantriAbsen = dataSantriAbsen[0] || [];
+  var idxNisAbsen = -1;
+  for (var ai = 0; ai < headerSantriAbsen.length; ai++) {
+    if ((headerSantriAbsen[ai] || '').toString().trim().toUpperCase() === 'NIS') {
+      idxNisAbsen = ai;
+      break;
+    }
+  }
+  if (idxNisAbsen < 0) return responError('Kolom NIS tidak ditemukan.');
+
+  var santriAda = false;
+  for (var aj = 1; aj < dataSantriAbsen.length; aj++) {
+    if ((dataSantriAbsen[aj][idxNisAbsen] || '').toString().replace(/'/g, '').trim() === nisAbsen) {
+      santriAda = true;
+      break;
+    }
+  }
+  if (!santriAda) return responError('NIS tidak terdaftar.');
+
   var ss = SpreadsheetApp.getActiveSpreadsheet();
   var timezone = Session.getScriptTimeZone();
   
@@ -2072,4 +2231,32 @@ function hapusLokasiAbsen(e) {
      sheet.getRange("G2").setValue("");
   }
   return responSukses({ message: 'Batasan lokasi berhasil dihapus! Sekarang santri bisa absen dari mana saja.' });
+}
+
+// PASSWORD:
+// Mendukung password SHA-256 dengan format "sha256:<hex>".
+// Password lama plaintext tetap didukung sementara agar akun lama tidak terkunci.
+// Setelah semua password di Sheet LOGIN dimigrasikan ke hash, dukungan plaintext dapat dihapus.
+function hashPasswordMadasa_(password) {
+  var digest = Utilities.computeDigest(
+    Utilities.DigestAlgorithm.SHA_256,
+    String(password),
+    Utilities.Charset.UTF_8
+  );
+  return digest.map(function(b) {
+    var v = (b < 0 ? b + 256 : b).toString(16);
+    return v.length === 1 ? '0' + v : v;
+  }).join('');
+}
+
+function passwordCocokMadasa_(inputPassword, passwordTersimpan) {
+  var stored = String(passwordTersimpan == null ? '' : passwordTersimpan);
+  var input = String(inputPassword == null ? '' : inputPassword);
+
+  if (stored.toLowerCase().indexOf('sha256:') === 0) {
+    return hashPasswordMadasa_(input) === stored.substring(7).toLowerCase();
+  }
+
+  // Kompatibilitas sementara untuk data LOGIN lama.
+  return input === stored;
 }
