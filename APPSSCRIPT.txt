@@ -245,6 +245,23 @@ function getSppSantriPublik(e) {
 // =================================================================
 // 1. FUNGSI LOGIN (PEMBUAT TOKEN)
 // =================================================================
+
+// ================================================================
+// ZONA WAKTU MADASA
+// Seluruh waktu operasional menggunakan WIB (Asia/Jakarta, UTC+7).
+// Untuk pencatatan ke Spreadsheet, Date tetap disimpan sebagai nilai tanggal
+// agar bisa dihitung/sortir. Format tampilan kolom dipaksa ke WIB.
+// ================================================================
+var MADASA_TIMEZONE = 'Asia/Jakarta';
+
+function formatWaktuWIB_(tanggal) {
+  return Utilities.formatDate(tanggal || new Date(), MADASA_TIMEZONE, 'dd/MM/yyyy HH:mm:ss');
+}
+
+function setFormatWaktuWIB_(range) {
+  if (range) range.setNumberFormat('dd/MM/yyyy HH:mm:ss');
+}
+
 function prosesLogin(e) {
   var lock = LockService.getScriptLock();
   if (!lock.tryLock(10000)) {
@@ -288,7 +305,11 @@ function prosesLogin(e) {
         // Dengan demikian akun bersama seperti "gurumadasa" dapat dipakai
         // banyak guru/perangkat secara bersamaan.
         var token = Utilities.getUuid();
-        sheetSesi.appendRow([token, user, roleUser, new Date()]);
+        var waktuLoginWIB = new Date();
+        sheetSesi.appendRow([token, user, roleUser, waktuLoginWIB]);
+        // Google Sheets menyimpan Date sebagai timestamp; format kolom D dibuat
+        // konsisten dd/MM/yyyy HH:mm:ss. Pastikan spreadsheet juga Asia/Jakarta.
+        setFormatWaktuWIB_(sheetSesi.getRange(sheetSesi.getLastRow(), 4));
 
         return responSukses({
           role: roleUser,
@@ -2259,4 +2280,21 @@ function passwordCocokMadasa_(inputPassword, passwordTersimpan) {
 
   // Kompatibilitas sementara untuk data LOGIN lama.
   return input === stored;
+}
+
+
+// Jalankan SEKALI dari editor Apps Script setelah memasang kode ini.
+// Fungsi ini mengatur zona waktu file Spreadsheet menjadi Asia/Jakarta (WIB)
+// dan merapikan format kolom Waktu Login yang sudah ada.
+function setupZonaWaktuMADASA() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  ss.setSpreadsheetTimeZone(MADASA_TIMEZONE);
+
+  var sheetSesi = ss.getSheetByName('SesiAktif');
+  if (sheetSesi && sheetSesi.getMaxRows() >= 2) {
+    sheetSesi.getRange(2, 4, sheetSesi.getMaxRows() - 1, 1)
+      .setNumberFormat('dd/MM/yyyy HH:mm:ss');
+  }
+
+  return 'Zona waktu MADASA sudah diatur ke Asia/Jakarta (WIB).';
 }
